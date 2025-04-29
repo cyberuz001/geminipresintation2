@@ -114,9 +114,36 @@ async def check_premium_limit(user_id: int, content_type: str) -> bool:
         count = db.get_user_attribute(user_id, content_type)
         return count < 15
     
-    # Regular users can create up to 2 items
+    # Regular users can create up to 1 item (changed from 2 to 1)
     count = db.get_user_attribute(user_id, content_type)
-    return count < 2
+    return count < 1
+
+
+async def check_expired_premium(context: CallbackContext) -> None:
+    """Check for expired premium subscriptions and notify users"""
+    try:
+        # Get expired users and remove their premium status
+        expired_users = db.remove_expired_premium()
+        
+        # Notify each user about their expired premium
+        for user in expired_users:
+            user_id = user['user_id']
+            chat_id = db.get_user_attribute(user_id, "chat_id")
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ *Premium obuna muddati tugadi*\n\n"
+                         "Sizning premium obunangiz muddati tugadi. "
+                         "Premium imkoniyatlardan foydalanish uchun obunani yangilang.\n\n"
+                         f"Premium obuna sotib olish uchun admin bilan bog'laning: @{config.admin_username}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                logger.info(f"Notified user {user_id} about expired premium")
+            except Exception as e:
+                logger.error(f"Failed to notify user {user_id} about expired premium: {e}")
+    except Exception as e:
+        logger.error(f"Error in check_expired_premium: {e}")
 
 
 async def start_handle(update: Update, context: CallbackContext):
@@ -218,8 +245,15 @@ TYPES = ["Fun", "Serious", "Creative", "Informative", "Inspirational", "Motivati
          "Magical", "Mystery", "Travel", "Documentary", "Crime", "Cooking"]
 TYPES_EMOJI = ["😂", "😐", "🎨", "📚", "🌟", "💪", "👨‍🎓", "🏛️", "💕", "🕵️‍♂️", "🧘‍♀️", "🗺️", "🤣", "🔬", "🎵", "😱", "🦄",
                "💥", "😮", "🙃", "🌸", "😰", "⚽", "😆", "📜", "🗳️", "✨", "🔮", "✈️", "🎥", "🚓", "🍽️"]
-COUNTS = [str(i) for i in range(3, 27)]
-COUNTS_EMOJI = ["📊"] * 24  # Use the same emoji for all counts
+
+# Taqdimot uchun slaydlar soni (oddiy foydalanuvchilar uchun max 12, premium uchun max 26)
+SLIDE_COUNTS = [str(i) for i in range(3, 27)]
+SLIDE_COUNTS_EMOJI = ["📊"] * 24  # Use the same emoji for all counts
+
+# Abstrakt uchun sahifalar soni (oddiy foydalanuvchilar uchun uchun 2-6, premium uchun 2-15)
+PAGE_COUNTS = [str(i) for i in range(2, 16)]
+PAGE_COUNTS_EMOJI = ["📄"] * 14  # Use the same emoji for all page counts
+
 PLAN_COUNTS = [str(i) for i in range(3, 11)]
 PLAN_COUNTS_EMOJI = ["📋"] * 8  # Use the same emoji for all plan counts
 BACK = "⬅️Orqaga"
@@ -231,11 +265,12 @@ BACK = "⬅️Orqaga"
     ABSTRACT_TYPE_CHOICE,
     COUNT_SLIDE_CHOICE,
     PLAN_COUNT_CHOICE,
+    ABSTRACT_PAGE_COUNT_CHOICE,
     TOPIC_CHOICE,
     API_RESPONSE,
     START_OVER,
     MESSAGE_ID,
-) = map(chr, range(10, 21))
+) = map(chr, range(10, 22))
 
 
 async def menu_handle(update: Update, context: CallbackContext) -> str:
@@ -326,7 +361,7 @@ async def presentation_language_callback(update: Update, context: CallbackContex
                 await update.callback_query.answer("Siz premium foydalanuvchi uchun maksimal miqdorga yetdingiz (15 ta taqdimot).", show_alert=True)
             else:
                 await update.callback_query.edit_message_text(
-                    "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (2 ta taqdimot).\n\n"
+                    "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (1 ta taqdimot).\n\n"
                     "Premium obuna sotib olish uchun admin bilan bog'laning: "
                     f"@{config.admin_username}",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data=str(END))]])
@@ -367,7 +402,7 @@ async def abstract_language_callback(update: Update, context: CallbackContext) -
             await update.callback_query.answer("Siz premium foydalanuvchi uchun maksimal miqdorga yetdingiz (15 ta abstrakt).", show_alert=True)
         else:
             await update.callback_query.edit_message_text(
-                "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (2 ta abstrakt).\n\n"
+                "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (1 ta abstrakt).\n\n"
                 "Premium obuna sotib olish uchun admin bilan bog'laning: "
                 f"@{config.admin_username}",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data=str(END))]])
@@ -444,13 +479,47 @@ async def presentation_slide_count_callback(update: Update, context: CallbackCon
     await register_user_if_not_exists(update.callback_query, context, update.callback_query.from_user)
     query = update.callback_query
     data = query.data
+    user_id = update.callback_query.from_user.id
     page = 1
+    
     if data.startswith("page_slide_count_"):
         page = int(data.replace("page_slide_count_", ""))
     else:
         context.user_data[PRESENTATION_TYPE_CHOICE] = data
+    
     text = "Taqdimot uchun taxminiy slaydlar sonini tanlang:"
-    reply_markup = await generate_keyboard(page, COUNTS, COUNTS_EMOJI, "slide_count_")
+    
+    # Oddiy foydalanuvchilar uchun max 12 slide, premium uchun max 26
+    is_premium = db.is_premium(user_id) or db.is_admin(user_id)
+    max_slides = 26 if is_premium else 12
+    available_counts = SLIDE_COUNTS[:max_slides-2]  # 3 dan max_slides gacha
+    
+    reply_markup = await generate_keyboard(page, available_counts, SLIDE_COUNTS_EMOJI[:len(available_counts)], "slide_count_")
+    await query.answer()
+    await query.edit_message_text(text=text, reply_markup=reply_markup)
+    return SELECTING_MENU
+
+
+async def abstract_page_count_callback(update: Update, context: CallbackContext) -> str:
+    await register_user_if_not_exists(update.callback_query, context, update.callback_query.from_user)
+    query = update.callback_query
+    data = query.data
+    user_id = update.callback_query.from_user.id
+    page = 1
+    
+    if data.startswith("page_page_count_"):
+        page = int(data.replace("page_page_count_", ""))
+    else:
+        context.user_data[ABSTRACT_TYPE_CHOICE] = data
+    
+    text = "Abstrakt uchun sahifalar sonini tanlang:"
+    
+    # Oddiy foydalanuvchilar uchun 2-6 page, premium uchun 2-15
+    is_premium = db.is_premium(user_id) or db.is_admin(user_id)
+    max_pages = 15 if is_premium else 6
+    available_counts = PAGE_COUNTS[:max_pages-1]  # 2 dan max_pages gacha
+    
+    reply_markup = await generate_keyboard(page, available_counts, PAGE_COUNTS_EMOJI[:len(available_counts)], "page_count_")
     await query.answer()
     await query.edit_message_text(text=text, reply_markup=reply_markup)
     return SELECTING_MENU
@@ -490,7 +559,7 @@ async def abstract_topic_callback(update: Update, context: CallbackContext) -> s
     query = update.callback_query
     data = query.data
     text = "Abstrakt mavzusi nima?"
-    context.user_data[ABSTRACT_TYPE_CHOICE] = data
+    context.user_data[ABSTRACT_PAGE_COUNT_CHOICE] = data
     await query.answer()
     await query.edit_message_text(text=text)
     if MESSAGE_ID in context.chat_data:
@@ -609,7 +678,7 @@ async def presentation_save_input(update: Update, context: CallbackContext):
                     await update.message.reply_text("Siz premium foydalanuvchi uchun maksimal miqdorga yetdingiz (15 ta taqdimot).")
                 else:
                     await update.message.reply_text(
-                        "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (2 ta taqdimot).\n\n"
+                        "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (1 ta taqdimot).\n\n"
                         "Premium obuna sotib olish uchun admin bilan bog'laning: "
                         f"@{config.admin_username}"
                     )
@@ -636,7 +705,7 @@ async def presentation_save_input(update: Update, context: CallbackContext):
     return END
 
 
-async def auto_generate_abstract(update: Update, context: CallbackContext, user_id, message_id, prompt):
+async def auto_generate_abstract(update: Update, context: CallbackContext, user_id, message_id, prompt, page_count):
     notification_message = await update.message.reply_text("⌛ Tayyorlanmoqda...")
     
     try:
@@ -694,7 +763,8 @@ async def auto_generate_abstract(update: Update, context: CallbackContext, user_
     await notification_message.edit_text("⌛ Abstrakt yaratilmoqda...")
     
     try:
-        docx_bytes, docx_title = await abstract.generate_docx(response)
+        # Pass the page_count parameter to generate_docx
+        docx_bytes, docx_title = await abstract.generate_docx(response, page_count)
         
         # Success message
         await update.message.reply_text(f"✅ Abstrakt muvaffaqiyatli yaratildi: {docx_title}")
@@ -719,19 +789,22 @@ async def abstract_save_input(update: Update, context: CallbackContext):
     user_mode = db.get_user_attribute(user_id, "current_chat_mode")
     language_choice = user_data[ABSTRACT_LANGUAGE_CHOICE].replace("language_", "")
     type_choice = user_data[ABSTRACT_TYPE_CHOICE].replace("type_", "")
-    prompt = await abstract.generate_docx_prompt(language_choice, type_choice, topic_choice)
+    page_count = user_data[ABSTRACT_PAGE_COUNT_CHOICE].replace("page_count_", "")
+    
+    prompt = await abstract.generate_docx_prompt(language_choice, type_choice, topic_choice, page_count)
+    
     if user_mode == "auto":
         # Check if user can create more abstracts
         if await check_premium_limit(user_id, "abstracts_created"):
             loop = asyncio.get_event_loop()
-            loop.create_task(auto_generate_abstract(update, context, user_id, message_id, prompt))
+            loop.create_task(auto_generate_abstract(update, context, user_id, message_id, prompt, page_count))
         else:
             is_premium = db.is_premium(user_id)
             if is_premium:
                 await update.message.reply_text("Siz premium foydalanuvchi uchun maksimal miqdorga yetdingiz (15 ta abstrakt).")
             else:
                 await update.message.reply_text(
-                    "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (2 ta abstrakt).\n\n"
+                    "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (1 ta abstrakt).\n\n"
                     "Premium obuna sotib olish uchun admin bilan bog'laning: "
                     f"@{config.admin_username}"
                 )
@@ -771,7 +844,7 @@ async def presentation_prompt_callback(update: Update, context: CallbackContext)
             await update.message.reply_text("Siz premium foydalanuvchi uchun maksimal miqdorga yetdingiz (15 ta taqdimot).")
         else:
             await update.message.reply_text(
-                "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (2 ta taqdimot).\n\n"
+                "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (1 ta taqdimot).\n\n"
                 "Premium obuna sotib olish uchun admin bilan bog'laning: "
                 f"@{config.admin_username}"
             )
@@ -809,7 +882,9 @@ async def abstract_prompt_callback(update: Update, context: CallbackContext):
         return
     await register_user_if_not_exists(update, context, update.message.from_user)
     api_response = update.message.text
+    user_data = context.user_data
     user_id = update.message.from_user.id
+    page_count = user_data[ABSTRACT_PAGE_COUNT_CHOICE].replace("page_count_", "")
     
     # Check if user can create more abstracts
     if not await check_premium_limit(user_id, "abstracts_created"):
@@ -818,7 +893,7 @@ async def abstract_prompt_callback(update: Update, context: CallbackContext):
             await update.message.reply_text("Siz premium foydalanuvchi uchun maksimal miqdorga yetdingiz (15 ta abstrakt).")
         else:
             await update.message.reply_text(
-                "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (2 ta abstrakt).\n\n"
+                "⚠️ Siz oddiy foydalanuvchi uchun maksimal miqdorga yetdingiz (1 ta abstrakt).\n\n"
                 "Premium obuna sotib olish uchun admin bilan bog'laning: "
                 f"@{config.admin_username}"
             )
@@ -831,7 +906,7 @@ async def abstract_prompt_callback(update: Update, context: CallbackContext):
         # Increment the abstracts counter for the user
         db.increment_user_counter(user_id, "abstracts_created")
         
-        docx_bytes, docx_title = await abstract.generate_docx(api_response)
+        docx_bytes, docx_title = await abstract.generate_docx(api_response, page_count)
         
         # Success message
         await update.message.reply_text(f"✅ Abstrakt muvaffaqiyatli yaratildi: {docx_title}")
@@ -879,11 +954,34 @@ async def premium_status_handle(update: Update, context: CallbackContext):
         text = f"🟢 <b>Admin</b> sifatida sizda cheksiz imkoniyatlar mavjud\n\n"
         text += f"Siz jami <b>{presentations_created}</b> ta taqdimot va <b>{abstracts_created}</b> ta abstrakt yaratdingiz"
     elif is_premium:
-        text = f"👑 Siz <b>Premium</b> obunachisiz\n\n"
-        text += f"Siz <b>{presentations_created}/15</b> ta taqdimot va <b>{abstracts_created}/15</b> ta abstrakt yaratdingiz"
+        # Get premium expiry date
+        premium_expiry = db.get_premium_expiry(user_id)
+        expiry_text = ""
+        
+        if premium_expiry:
+            try:
+                expiry_date = datetime.fromisoformat(premium_expiry)
+                days_left = (expiry_date - datetime.now()).days
+                expiry_display = expiry_date.strftime("%d.%m.%Y")
+                
+                if days_left > 0:
+                    expiry_text = f"\nPremium obuna muddati: <b>{expiry_display}</b> ({days_left} kun qoldi)"
+                else:
+                    expiry_text = f"\nPremium obuna muddati: <b>Bugun tugaydi</b>"
+            except Exception as e:
+                logger.error(f"Error formatting premium expiry: {e}")
+        
+        text = f"👑 Siz <b>Premium</b> obunachisiz{expiry_text}\n\n"
+        text += f"Siz <b>{presentations_created}/15</b> ta taqdimot va <b>{abstracts_created}/15</b> ta abstrakt yaratdingiz\n\n"
+        text += f"Premium imkoniyatlar:\n"
+        text += f"• Taqdimot: <b>26</b> tagacha slayd\n"
+        text += f"• Abstrakt: <b>15</b> tagacha sahifa"
     else:
         text = f"⚪ Siz oddiy foydalanuvchisiz\n\n"
-        text += f"Siz <b>{presentations_created}/2</b> ta taqdimot va <b>{abstracts_created}/2</b> ta abstrakt yaratdingiz\n\n"
+        text += f"Siz <b>{presentations_created}/1</b> ta taqdimot va <b>{abstracts_created}/1</b> ta abstrakt yaratdingiz\n\n"
+        text += f"Oddiy foydalanuvchi imkoniyatlari:\n"
+        text += f"• Taqdimot: <b>12</b> tagacha slayd\n"
+        text += f"• Abstrakt: <b>6</b> tagacha sahifa\n\n"
         text += f"Premium obuna sotib olish uchun admin bilan bog'laning: @{config.admin_username}"
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -1010,6 +1108,9 @@ def create_application() -> Application:
         .build()
     )
 
+    # Schedule job to check expired premium subscriptions (every 12 hours)
+    application.job_queue.run_repeating(check_expired_premium, interval=43200, first=10)
+
     # add handlers
     if len(config.allowed_telegram_usernames) == 0:
         user_filter = filters.ALL
@@ -1075,7 +1176,9 @@ def create_application() -> Application:
                 CallbackQueryHandler(abstract_language_callback, pattern="^page_language_"),
                 CallbackQueryHandler(abstract_type_callback, pattern="^language_"),
                 CallbackQueryHandler(abstract_type_callback, pattern="^page_type_"),
-                CallbackQueryHandler(abstract_topic_callback, pattern="^type_")
+                CallbackQueryHandler(abstract_page_count_callback, pattern="^type_"),
+                CallbackQueryHandler(abstract_page_count_callback, pattern="^page_page_count_"),
+                CallbackQueryHandler(abstract_topic_callback, pattern="^page_count_")
                              ],
             INPUT_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, abstract_save_input)],
             INPUT_PROMPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, abstract_prompt_callback)],
