@@ -1,0 +1,10 @@
+auto:
+  name: 🤖 Avtomatik
+  welcome_message: 🤖 Salom, men <b>Gemini AI</b> botman. Nimani yaratmoqchisiz?
+  parse_mode: html
+
+
+manual:
+  name: 👩🏼‍💻 Qo'lda
+  welcome_message: 👩🏼‍💻 Nimani yaratmoqchisiz?
+  parse_mode: html

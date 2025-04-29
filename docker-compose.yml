@@ -1,0 +1,37 @@
+version: "3"
+
+services:
+  mysql:
+    container_name: mysql
+    image: mysql:8.0
+    restart: always
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-your_password}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-chatgpt_telegram_bot}
+    volumes:
+      - ${MYSQL_PATH:-./mysql_data}:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+
+  chatgpt_telegram_bot:
+    container_name: chatgpt_telegram_bot
+    command: python3 bot/bot.py
+    restart: always
+    build:
+      context: "."
+      dockerfile: Dockerfile
+    depends_on:
+      - mysql
+
+  phpmyadmin:
+    container_name: phpmyadmin
+    image: phpmyadmin/phpmyadmin
+    restart: always
+    ports:
+      - "${PHPMYADMIN_PORT:-8080}:80"
+    environment:
+      PMA_HOST: mysql
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-your_password}
+    depends_on:
+      - mysql
